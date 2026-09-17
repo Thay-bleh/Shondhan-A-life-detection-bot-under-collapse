@@ -4,11 +4,11 @@ import json
 import socket
 import random
 import re
+import struct
+import time
 from PySide6.QtWidgets import *
 from PySide6.QtCore import *
 from PySide6.QtGui import *
-from PySide6.QtMultimedia import QCamera, QMediaDevices, QMediaCaptureSession
-from PySide6.QtMultimediaWidgets import QVideoWidget
 
 # ---------------------------------------------------------------------------
 # Palette (matches the approved HTML mockup)
@@ -27,10 +27,9 @@ GREEN = "#15803d"
 GREEN_HOVER = "#1a9a4a"
 RED = "#b91c1c"
 
-NAV_MIN, NAV_MAX, NAV_NEUTRAL = 1000, 2000, 1500
-
 
 class TelemetryReceiver(QThread):
+    """Listens for JSON telemetry (gas sensor readings) sent by the Teensy 4.1."""
     data_received = Signal(dict)
 
     def __init__(self, port=8889):
@@ -43,9 +42,9 @@ class TelemetryReceiver(QThread):
     def run(self):
         try:
             self.sock.bind(("0.0.0.0", self.port))
-            print(f"[UDP RECEIVER] Listening for Jetson Orin telemetry on port {self.port}...")
+            print(f"[UDP TELEMETRY] Listening for Teensy sensor data on port {self.port}...")
         except Exception as e:
-            print(f"[UDP RECEIVER] Bind warning for port {self.port}: {e}")
+            print(f"[UDP TELEMETRY] Bind warning for port {self.port}: {e}")
             return
 
         self.sock.settimeout(0.5)
@@ -54,11 +53,110 @@ class TelemetryReceiver(QThread):
                 data, addr = self.sock.recvfrom(2048)
                 payload = json.loads(data.decode('utf-8'))
                 self.data_received.emit(payload)
-                print(f"[JETSON TELEMETRY] from {addr[0]}:{addr[1]} -> {payload}")
+                print(f"[TEENSY TELEMETRY] from {addr[0]}:{addr[1]} -> {payload}")
             except socket.timeout:
                 continue
             except Exception:
                 pass
+
+    def stop(self):
+        self.running = False
+        self.sock.close()
+
+
+class VideoFrameReceiver(QThread):
+    """
+    Receives the ZED 2i feed (raw + object-detection) from the Jetson as chunked,
+    JPEG-encoded UDP frames and reassembles them into QImages.
+
+    Wire format expected from the Jetson, per UDP datagram:
+
+        struct format "!IHHB"  (9-byte header, network byte order)
+        ------------------------------------------------------------
+        frame_id      uint32   monotonically increasing per encoded frame
+        chunk_index   uint16   0-based index of this chunk within the frame
+        total_chunks  uint16   total number of chunks that make up the frame
+        stream_type   uint8    0 = raw ZED 2i feed, 1 = object-detection overlay feed
+        ------------------------------------------------------------
+        followed by the raw chunk payload (a slice of the JPEG-encoded frame).
+
+    Frames should be split into chunks of ~1400 bytes (VIDEO_CHUNK_PAYLOAD) so
+    each datagram fits under a standard 1500-byte MTU without IP fragmentation.
+    A single-chunk frame just sends total_chunks=1, chunk_index=0.
+
+    The dashboard reassembles chunks per frame_id, decodes the completed JPEG,
+    and emits it with its stream_type. Incomplete frames older than ~1s are
+    dropped so one lost packet can't stall the buffer forever.
+    """
+    frame_received = Signal(QImage, int)
+
+    HEADER_FMT = "!IHHB"
+    HEADER_SIZE = struct.calcsize(HEADER_FMT)
+    STALE_FRAME_SECONDS = 1.0
+
+    def __init__(self, port=8890):
+        super().__init__()
+        self.port = port
+        self.running = True
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            # video needs a bigger receive buffer than the small JSON command/telemetry sockets
+            self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1 << 20)
+        except OSError:
+            pass
+        self._buffers = {}  # frame_id -> {"chunks": [bytes|None]*n, "count": int, "stream_type": int, "ts": float}
+
+    def run(self):
+        try:
+            self.sock.bind(("0.0.0.0", self.port))
+            print(f"[UDP VIDEO] Listening for ZED 2i frames on port {self.port}...")
+        except Exception as e:
+            print(f"[UDP VIDEO] Bind warning for port {self.port}: {e}")
+            return
+
+        self.sock.settimeout(0.5)
+        while self.running:
+            try:
+                data, addr = self.sock.recvfrom(65535)
+            except socket.timeout:
+                self._expire_stale_frames()
+                continue
+            except Exception:
+                continue
+
+            if len(data) < self.HEADER_SIZE:
+                continue
+            frame_id, chunk_index, total_chunks, stream_type = struct.unpack(
+                self.HEADER_FMT, data[:self.HEADER_SIZE]
+            )
+            chunk_payload = data[self.HEADER_SIZE:]
+
+            entry = self._buffers.get(frame_id)
+            if entry is None:
+                if total_chunks == 0 or total_chunks > 4096:
+                    continue  # guard against a corrupt header
+                entry = {"chunks": [None] * total_chunks, "count": 0, "stream_type": stream_type, "ts": time.time()}
+                self._buffers[frame_id] = entry
+
+            if 0 <= chunk_index < len(entry["chunks"]) and entry["chunks"][chunk_index] is None:
+                entry["chunks"][chunk_index] = chunk_payload
+                entry["count"] += 1
+
+            if entry["count"] == len(entry["chunks"]):
+                jpeg_bytes = b"".join(entry["chunks"])
+                del self._buffers[frame_id]
+                image = QImage.fromData(jpeg_bytes, "JPG")
+                if not image.isNull():
+                    self.frame_received.emit(image, entry["stream_type"])
+
+            self._expire_stale_frames()
+
+    def _expire_stale_frames(self):
+        now = time.time()
+        stale_ids = [fid for fid, e in self._buffers.items() if now - e["ts"] > self.STALE_FRAME_SECONDS]
+        for fid in stale_ids:
+            del self._buffers[fid]
 
     def stop(self):
         self.running = False
@@ -205,43 +303,6 @@ class SensorCard(QFrame):
         is_alert = val > self.alert_val
         self.dial.set_value(val, is_alert)
         return is_alert
-
-
-class NavGauge(QWidget):
-    """Horizontal channel gauge, 1000-2000, filled from the 1500 neutral centre."""
-    def __init__(self):
-        super().__init__()
-        self.setFixedHeight(10)
-        self.value = NAV_NEUTRAL
-
-    def set_value(self, v):
-        self.value = v
-        self.update()
-
-    def paintEvent(self, event):
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.Antialiasing)
-        w, h = self.width(), self.height()
-
-        # track
-        painter.setPen(QPen(QColor(BORDER), 1))
-        painter.setBrush(QColor(PANEL_2))
-        painter.drawRoundedRect(0, 1, w - 1, h - 2, 4, 4)
-
-        # fill, from centre (1500) toward current value
-        pct = (self.value - NAV_MIN) / (NAV_MAX - NAV_MIN)
-        center_x = w / 2
-        val_x = pct * w
-        painter.setPen(Qt.NoPen)
-        painter.setBrush(QColor(ORANGE))
-        if val_x >= center_x:
-            painter.drawRoundedRect(int(center_x), 1, int(val_x - center_x), h - 2, 4, 4)
-        else:
-            painter.drawRoundedRect(int(val_x), 1, int(center_x - val_x), h - 2, 4, 4)
-
-        # centre tick
-        painter.setPen(QPen(QColor(TEXT_FAINT), 1))
-        painter.drawLine(int(center_x), -3, int(center_x), h + 3)
 
 
 class ServoCard(QFrame):
@@ -395,27 +456,30 @@ class ServoCard(QFrame):
 class FormalDashboard(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.bot_ip = "192.168.2.116"      # Jetson Orin IP
-        self.udp_port = 8888                # Command port to Jetson
-        self.telemetry_port = 8889          # Telemetry reception port
+        # Jetson Orin Nano: camera / object-detection compute
+        self.jetson_ip = "192.168.2.116"
+        self.jetson_cmd_port = 8888     # start/stop + object-detection toggle commands
+        self.jetson_video_port = 8890   # incoming ZED 2i frames (raw + detection), see VideoFrameReceiver
+
+        # Teensy 4.1: motor control (Sabertooth), servos, MQ2 gas sensor
+        # NOTE: the Teensy 4.1 has no networking of its own -- this assumes it (or a
+        # bridge in front of it, e.g. an attached Ethernet/WiFi module, or the Jetson
+        # relaying UDP<->Serial) is reachable at this IP. Update it to match your setup.
+        self.teensy_ip = "192.168.2.117"
+        self.teensy_cmd_port = 8888        # servo commands
+        self.teensy_telemetry_port = 8889  # incoming gas sensor readings
 
         self.is_running = False
         self.simulated_mode = True
 
         self.gas_val = 0.0
-        self.throttle = NAV_NEUTRAL
-        self.steering = NAV_NEUTRAL
-        self.keys_held = {"w": False, "a": False, "s": False, "d": False}
 
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
         self.init_ui()
-        self.setup_camera()
+        self.setup_video_receiver()
 
-        # global WASD capture regardless of which widget currently has focus
-        QApplication.instance().installEventFilter(self)
-
-        self.receiver = TelemetryReceiver(self.telemetry_port)
+        self.receiver = TelemetryReceiver(self.teensy_telemetry_port)
         self.receiver.data_received.connect(self.handle_telemetry)
         self.receiver.start()
 
@@ -423,12 +487,15 @@ class FormalDashboard(QMainWindow):
         self.sim_timer.timeout.connect(self.simulate_telemetry)
         self.sim_timer.start(1000)
 
+        self.video_watchdog = QTimer()
+        self.video_watchdog.timeout.connect(self._check_video_staleness)
+        self.video_watchdog.start(1000)
+
         print("\n" + "=" * 60)
-        print("  [+] SHONDHAN BOT - JETSON ORIN COMMAND CENTER [+]")
+        print("  [+] SHONDHAN BOT - COMMAND CENTER [+]")
         print("=" * 60)
-        print(f"Target Bot IP (Jetson)  : {self.bot_ip}")
-        print(f"UDP Command Port        : {self.udp_port}")
-        print(f"UDP Telemetry Port      : {self.telemetry_port}")
+        print(f"Jetson (camera / object detection) : {self.jetson_ip}:{self.jetson_cmd_port} (video in on :{self.jetson_video_port})")
+        print(f"Teensy (servos / gas sensor)        : {self.teensy_ip}:{self.teensy_cmd_port} (telemetry in on :{self.teensy_telemetry_port})")
         print("=" * 60 + "\n")
 
     # ------------------------------------------------------------------
@@ -438,7 +505,6 @@ class FormalDashboard(QMainWindow):
         self.setWindowTitle("Shondhan Bot")
         self.resize(1200, 820)
         self.setMinimumSize(540, 550)
-        self.setFocusPolicy(Qt.StrongFocus)
 
         self.setStyleSheet(f"""
             QMainWindow {{ background-color: {BG}; }}
@@ -486,7 +552,7 @@ class FormalDashboard(QMainWindow):
         header_layout.addLayout(title_box)
         header_layout.addStretch()
 
-        info_badge = QLabel(f"Jetson IP: {self.bot_ip}:{self.udp_port}")
+        info_badge = QLabel(f"Jetson: {self.jetson_ip}:{self.jetson_cmd_port}   \u00b7   Teensy: {self.teensy_ip}:{self.teensy_cmd_port}")
         info_badge.setStyleSheet(f"background-color: {PANEL_2}; color: {TEXT_DIM}; font-size: 11px; font-weight: 600; padding: 6px 12px; border-radius: 8px;")
         header_layout.addWidget(info_badge)
 
@@ -521,11 +587,13 @@ class FormalDashboard(QMainWindow):
         od_row.addStretch()
         v_layout.addLayout(od_row)
 
-        self.video_widget = QVideoWidget()
-        self.video_widget.setMinimumHeight(420)
-        self.video_widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        self.video_widget.setStyleSheet("background-color: #0f172a; border-radius: 8px;")
-        v_layout.addWidget(self.video_widget)
+        self.video_label = QLabel("Awaiting ZED 2i stream\u2026")
+        self.video_label.setMinimumHeight(420)
+        self.video_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.video_label.setAlignment(Qt.AlignCenter)
+        self.video_label.setScaledContents(False)
+        self.video_label.setStyleSheet(f"background-color: #0f172a; border-radius: 8px; color: {TEXT_FAINT}; font-size: 12px;")
+        v_layout.addWidget(self.video_label)
 
         self.cam_status_lbl = QLabel("ZED 2i Stream: Connecting...")
         self.cam_status_lbl.setStyleSheet(f"color: {TEXT_DIM}; font-size: 11px; font-weight: 600; border:none; background:transparent;")
@@ -572,37 +640,6 @@ class FormalDashboard(QMainWindow):
         p_layout.addWidget(self.stop_btn)
         right_col.addWidget(power_box)
 
-        # Manual navigation (WASD)
-        nav_box = QGroupBox("Manual navigation \u2014 WASD")
-        nav_layout = QVBoxLayout(nav_box)
-        nav_layout.setSpacing(10)
-
-        keys_grid = QGridLayout()
-        keys_grid.setSpacing(6)
-        self.key_lbls = {}
-        for key, (r, c) in {"w": (0, 1), "a": (1, 0), "s": (1, 1), "d": (1, 2)}.items():
-            lbl = QLabel(key.upper())
-            lbl.setAlignment(Qt.AlignCenter)
-            lbl.setFixedSize(40, 36)
-            self.key_lbls[key] = lbl
-            keys_grid.addWidget(lbl, r, c)
-        keys_wrap = QHBoxLayout()
-        keys_wrap.addStretch()
-        keys_wrap.addLayout(keys_grid)
-        keys_wrap.addStretch()
-        nav_layout.addLayout(keys_wrap)
-        self._paint_keys()
-
-        self.throttle_lbl, self.throttle_gauge = self._build_gauge_row(nav_layout, "Throttle (W / S)")
-        self.steer_lbl, self.steer_gauge = self._build_gauge_row(nav_layout, "Steering (A / D)")
-
-        hint = QLabel("Click on the window, then hold W / A / S / D. 1500 is neutral, 2000 / 1000 is full deflection; releasing a key snaps it back to neutral.")
-        hint.setWordWrap(True)
-        hint.setStyleSheet(f"color: {TEXT_FAINT}; font-size: 10.5px; border:none; background:transparent;")
-        nav_layout.addWidget(hint)
-
-        right_col.addWidget(nav_box)
-
         # Servo control, 2x2
         servo_box = QGroupBox("Servo control \u2014 4 channels")
         servo_grid = QGridLayout(servo_box)
@@ -617,37 +654,6 @@ class FormalDashboard(QMainWindow):
         body_layout.addLayout(right_col, 4)
         root_layout.addLayout(body_layout)
 
-    def _build_gauge_row(self, parent_layout, title):
-        row = QVBoxLayout()
-        row.setSpacing(4)
-        head = QHBoxLayout()
-        title_lbl = QLabel(title)
-        title_lbl.setStyleSheet(f"color: {TEXT_DIM}; font-size: 11px; border:none; background:transparent;")
-        val_lbl = QLabel(str(NAV_NEUTRAL))
-        val_lbl.setStyleSheet(f"color: {TEXT}; font-size: 11px; font-weight: 700; font-family: Consolas, monospace; border:none; background:transparent;")
-        head.addWidget(title_lbl)
-        head.addStretch()
-        head.addWidget(val_lbl)
-        row.addLayout(head)
-        gauge = NavGauge()
-        row.addWidget(gauge)
-        parent_layout.addLayout(row)
-        return val_lbl, gauge
-
-    def _paint_keys(self):
-        for key, lbl in self.key_lbls.items():
-            active = self.keys_held[key]
-            if active:
-                lbl.setStyleSheet(f"""
-                    background-color: {ORANGE}; color: #2a1103; border: 1px solid {ORANGE};
-                    border-radius: 6px; font-family: Consolas, monospace; font-weight: 700; font-size: 13px;
-                """)
-            else:
-                lbl.setStyleSheet(f"""
-                    background-color: {PANEL_2}; color: {TEXT_DIM}; border: 1px solid {BORDER};
-                    border-radius: 6px; font-family: Consolas, monospace; font-size: 13px;
-                """)
-
     def _pill_style(self, mode):
         styles = {
             "idle": f"background-color: {PANEL_2}; color: {TEXT_DIM}; font-size: 12px; font-weight: 700; padding: 6px 16px; border-radius: 16px;",
@@ -659,56 +665,55 @@ class FormalDashboard(QMainWindow):
     # ------------------------------------------------------------------
     # Camera
     # ------------------------------------------------------------------
-    def setup_camera(self):
-        self._cam_state = "connecting"  # connecting | active | waiting | error
-        try:
-            cameras = QMediaDevices.videoInputs()
-            if cameras:
-                self.camera = QCamera(cameras[0])
-                self.capture_session = QMediaCaptureSession()
-                self.capture_session.setCamera(self.camera)
-                self.capture_session.setVideoOutput(self.video_widget)
-                self.camera.start()
-                self._cam_state = "active"
-                print("[ZED 2i CAMERA] Local capture session connected.")
-            else:
-                self._cam_state = "waiting"
-                print("[ZED 2i CAMERA] Ready for network stream.")
-        except Exception as e:
-            print(f"[ZED 2i CAMERA ERROR] {e}")
-            self._cam_state = "error"
+    def setup_video_receiver(self):
+        self._video_last_seen = {0: 0.0, 1: 0.0}  # stream_type -> last time a frame of that type arrived
+        self._video_cur_pixmap = None
+        self.video_receiver = VideoFrameReceiver(self.jetson_video_port)
+        self.video_receiver.frame_received.connect(self.handle_video_frame)
+        self.video_receiver.start()
+        self._refresh_cam_status()
+
+    def handle_video_frame(self, image, stream_type):
+        self._video_last_seen[stream_type] = time.time()
+
+        desired_type = 1 if self.object_detection_enabled else 0
+        if stream_type != desired_type:
+            return  # a frame for the stream we're not currently displaying
+
+        pix = QPixmap.fromImage(image)
+        scaled = pix.scaled(self.video_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        self._video_cur_pixmap = scaled
+        self.video_label.setPixmap(scaled)
+        self._refresh_cam_status()
+
+    def _check_video_staleness(self):
         self._refresh_cam_status()
 
     def _refresh_cam_status(self):
-        """Combine connection state + Object Detection toggle into the status line under the feed."""
-        od_suffix = " \u00b7 Object detection ON" if self.object_detection_enabled else ""
-        if self._cam_state == "active":
-            self.cam_status_lbl.setText(f"ZED 2i Feed: Active{od_suffix}")
-            color = GREEN
-        elif self._cam_state == "waiting":
-            self.cam_status_lbl.setText(f"ZED 2i Feed: Awaiting Stream from Jetson{od_suffix}")
-            color = "#b3690a"
-        elif self._cam_state == "error":
-            self.cam_status_lbl.setText("Camera Stream Error")
-            color = RED
+        """Combine live-feed staleness + the Object Detection toggle into the status line under the feed."""
+        desired_type = 1 if self.object_detection_enabled else 0
+        last_seen = self._video_last_seen.get(desired_type, 0.0)
+        is_live = last_seen > 0 and (time.time() - last_seen) < 1.5
+        mode_label = "Object detection" if desired_type == 1 else "Raw"
+
+        if is_live:
+            self.cam_status_lbl.setText(f"ZED 2i Feed: Active \u00b7 {mode_label}")
+            self.cam_status_lbl.setStyleSheet(f"color: {GREEN}; font-size: 11px; font-weight: 600; border:none; background:transparent;")
         else:
-            self.cam_status_lbl.setText("ZED 2i Stream: Connecting...")
-            color = TEXT_DIM
-        self.cam_status_lbl.setStyleSheet(f"color: {color}; font-size: 11px; font-weight: 600; border:none; background:transparent;")
+            if last_seen > 0:
+                # we've seen this stream before but it's gone stale -- drop the frozen frame
+                self.video_label.setPixmap(QPixmap())
+                self.video_label.setText("Signal lost\u2026")
+            self.cam_status_lbl.setText(f"ZED 2i Feed: No Signal \u00b7 waiting for {mode_label.lower()} stream on :{self.jetson_video_port}")
+            self.cam_status_lbl.setStyleSheet(f"color: #b3690a; font-size: 11px; font-weight: 600; border:none; background:transparent;")
 
     def on_object_detection_toggled(self, checked):
         self.object_detection_enabled = checked
+        self.video_label.setPixmap(QPixmap())
+        self.video_label.setText("Switching stream\u2026")
         self._refresh_cam_status()
-        self.send_udp_command("set_object_detection", {"enabled": checked})
+        self.send_jetson_command("set_object_detection", {"enabled": checked})
         print(f"[JETSON COMMAND] Object detection overlay -> {'ON' if checked else 'OFF'}")
-        # NOTE: this switches the requested stream on the Jetson side and updates the
-        # status line here. Actually swapping the *displayed* video between the raw
-        # ZED feed and the annotated/object-detection feed depends on how the Jetson
-        # streams video to this app (e.g. two separate RTP/UDP ports, or one port with
-        # a mode flag). That network video pipeline isn't wired up in this file yet
-        # (video_widget currently only shows a locally attached camera, if any, as a
-        # placeholder) -- once it is, point self.video_widget's source at the
-        # raw-feed vs. detection-feed stream here based on self.object_detection_enabled.
 
     # ------------------------------------------------------------------
     # Start / stop
@@ -719,8 +724,9 @@ class FormalDashboard(QMainWindow):
         self.stop_btn.setEnabled(True)
         self.status_pill.setText("STATUS: ACTIVE")
         self.status_pill.setStyleSheet(self._pill_style("active"))
-        self.send_udp_command("start")
-        print("[ACTION] Start command sent to Jetson Orin.")
+        self.send_jetson_command("start")
+        self.send_teensy_command("start")
+        print("[ACTION] Start command sent to Jetson + Teensy.")
 
     def stop_bot(self):
         self.is_running = False
@@ -728,63 +734,19 @@ class FormalDashboard(QMainWindow):
         self.stop_btn.setEnabled(False)
         self.status_pill.setText("STATUS: IDLE")
         self.status_pill.setStyleSheet(self._pill_style("idle"))
-        # zero out manual nav so the rover doesn't keep the last held direction
-        self.keys_held = {k: False for k in self.keys_held}
-        self._update_nav()
-        self.send_udp_command("stop")
-        print("[ACTION] Stop command sent to Jetson Orin.")
+        self.send_jetson_command("stop")
+        self.send_teensy_command("stop")
+        print("[ACTION] Stop command sent to Jetson + Teensy.")
 
     # ------------------------------------------------------------------
-    # Manual navigation (WASD -> throttle / steering pulses)
-    # ------------------------------------------------------------------
-    # An application-wide event filter is used instead of overriding
-    # keyPressEvent/keyReleaseEvent on the window: with a QScrollArea as the
-    # central widget, keyboard focus usually lands on whichever button or
-    # field was last clicked, and QMainWindow.keyPressEvent never sees the
-    # key. The filter intercepts W/A/S/D no matter which widget has focus.
-    # It's safe to swallow these globally since no field in this app accepts
-    # letter input (servo custom angles are digits-only).
-    def eventFilter(self, obj, event):
-        if event.type() in (QEvent.KeyPress, QEvent.KeyRelease) and not event.isAutoRepeat():
-            if event.key() in (Qt.Key_W, Qt.Key_A, Qt.Key_S, Qt.Key_D):
-                self._handle_key(event.key(), event.type() == QEvent.KeyPress)
-                return True
-        return super().eventFilter(obj, event)
-
-    def _handle_key(self, qt_key, pressed):
-        mapping = {Qt.Key_W: "w", Qt.Key_A: "a", Qt.Key_S: "s", Qt.Key_D: "d"}
-        key = mapping.get(qt_key)
-        if key is None:
-            return
-        if not self.is_running:
-            if pressed:
-                print("[NOTICE] Click 'Start' first to enable Sabertooth motor control.")
-            return
-        self.keys_held[key] = pressed
-        self._update_nav()
-
-    def _update_nav(self):
-        self.throttle = NAV_MAX if self.keys_held["w"] else NAV_MIN if self.keys_held["s"] else NAV_NEUTRAL
-        self.steering = NAV_MAX if self.keys_held["a"] else NAV_MIN if self.keys_held["d"] else NAV_NEUTRAL
-
-        self.throttle_lbl.setText(str(self.throttle))
-        self.steer_lbl.setText(str(self.steering))
-        self.throttle_gauge.set_value(self.throttle)
-        self.steer_gauge.set_value(self.steering)
-        self._paint_keys()
-
-        self.send_udp_command("nav", {"throttle": self.throttle, "steering": self.steering})
-        print(f"[JETSON COMMAND] Nav -> throttle={self.throttle} steering={self.steering}")
-
-    # ------------------------------------------------------------------
-    # Servos
+    # Servos (commands go to the Teensy over UDP)
     # ------------------------------------------------------------------
     def send_servo_command(self, index, angle):
         if not self.is_running:
             QMessageBox.information(self, "System Idle", "Please click 'Start' before sending servo commands.")
             return
-        self.send_udp_command("servo", {"channel": index, "angle": angle})
-        print(f"[JETSON COMMAND] Servo {index} -> {angle}\u00b0")
+        self.send_teensy_command("servo", {"channel": index, "angle": angle})
+        print(f"[TEENSY COMMAND] Servo {index} -> {angle}\u00b0")
 
     # ------------------------------------------------------------------
     # Telemetry
@@ -799,7 +761,7 @@ class FormalDashboard(QMainWindow):
             return
         if self.simulated_mode:
             self.gas_val = max(0.0, self.gas_val + random.uniform(-0.3, 0.3))
-            print(f"[TEENSY SIMULATION] MQ2: {self.gas_val:.2f} ppm")
+            print(f"[TEENSY SIMULATION] MQ2: {self.gas_val:.2f} ppm (no real telemetry received yet on :{self.teensy_telemetry_port})")
             self.update_gas_ui()
 
     def update_gas_ui(self):
@@ -814,19 +776,25 @@ class FormalDashboard(QMainWindow):
     # ------------------------------------------------------------------
     # Networking / lifecycle
     # ------------------------------------------------------------------
-    def send_udp_command(self, command, data=None):
+    def _send(self, ip, port, command, data=None):
         try:
             payload = {"command": command, "data": data or {}}
             json_data = json.dumps(payload)
-            self.sock.sendto(json_data.encode('utf-8'), (self.bot_ip, self.udp_port))
+            self.sock.sendto(json_data.encode('utf-8'), (ip, port))
         except Exception as e:
-            print(f"[UDP ERROR] {e}")
+            print(f"[UDP ERROR] {command} -> {ip}:{port} failed: {e}")
+
+    def send_jetson_command(self, command, data=None):
+        self._send(self.jetson_ip, self.jetson_cmd_port, command, data)
+
+    def send_teensy_command(self, command, data=None):
+        self._send(self.teensy_ip, self.teensy_cmd_port, command, data)
 
     def closeEvent(self, event):
         self.receiver.stop()
         self.receiver.wait()
-        if hasattr(self, 'camera') and self.camera:
-            self.camera.stop()
+        self.video_receiver.stop()
+        self.video_receiver.wait()
         self.sock.close()
         event.accept()
 
