@@ -113,6 +113,56 @@ class GasDial(QWidget):
         painter.drawText(self.rect().adjusted(0, 16, 0, 16), Qt.AlignCenter, "PPM")
 
 
+class ToggleSwitch(QAbstractButton):
+    """Small animated pill toggle, styled to match the console (used for Object Detection)."""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setCheckable(True)
+        self.setCursor(Qt.PointingHandCursor)
+        self.setFixedSize(42, 22)
+        self._knob_pos = 3.0
+        self._anim = QPropertyAnimation(self, b"knob_pos", self)
+        self._anim.setDuration(140)
+        self._anim.setEasingCurve(QEasingCurve.OutCubic)
+        self.toggled.connect(self._animate_to)
+
+    def _animate_to(self, checked):
+        self._anim.stop()
+        self._anim.setStartValue(self._knob_pos)
+        self._anim.setEndValue(self.width() - 19.0 if checked else 3.0)
+        self._anim.start()
+
+    def get_knob_pos(self):
+        return self._knob_pos
+
+    def set_knob_pos(self, pos):
+        self._knob_pos = pos
+        self.update()
+
+    knob_pos = Property(float, get_knob_pos, set_knob_pos)
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+
+        if self.isChecked():
+            track_fill = QColor(ORANGE)
+            track_border = QColor(ORANGE_HOVER)
+        else:
+            track_fill = QColor("#c7cfd8")   # a clearly visible mid-gray, not near-white
+            track_border = QColor("#aab3bf")
+
+        painter.setPen(QPen(track_border, 1))
+        painter.setBrush(track_fill)
+        rect = QRectF(0.5, 0.5, self.width() - 1, self.height() - 1)
+        painter.drawRoundedRect(rect, self.height() / 2, self.height() / 2)
+
+        knob_d = self.height() - 6
+        painter.setPen(QPen(QColor("#aab3bf"), 1))
+        painter.setBrush(QColor("#ffffff"))
+        painter.drawEllipse(QRectF(self._knob_pos, 3, knob_d, knob_d))
+
+
 class SensorCard(QFrame):
     """MQ2 gas sensor card: a radial dial plus name/description, mirroring the mockup."""
     def __init__(self, title, unit="ppm", max_val=50.0, alert_val=20.0, accent_color=TEAL):
@@ -457,6 +507,19 @@ class FormalDashboard(QMainWindow):
         video_box = QGroupBox("Camera feed \u2014 ZED 2i")
         v_layout = QVBoxLayout(video_box)
         v_layout.setContentsMargins(8, 12, 8, 8)
+        v_layout.setSpacing(8)
+
+        od_row = QHBoxLayout()
+        od_row.setSpacing(8)
+        od_label = QLabel("Object detection")
+        od_label.setStyleSheet(f"color: {TEXT}; font-size: 12px; font-weight: 600; border:none; background:transparent;")
+        od_row.addWidget(od_label)
+        self.object_detection_enabled = False
+        self.od_toggle = ToggleSwitch()
+        self.od_toggle.toggled.connect(self.on_object_detection_toggled)
+        od_row.addWidget(self.od_toggle)
+        od_row.addStretch()
+        v_layout.addLayout(od_row)
 
         self.video_widget = QVideoWidget()
         self.video_widget.setMinimumHeight(420)
@@ -597,6 +660,7 @@ class FormalDashboard(QMainWindow):
     # Camera
     # ------------------------------------------------------------------
     def setup_camera(self):
+        self._cam_state = "connecting"  # connecting | active | waiting | error
         try:
             cameras = QMediaDevices.videoInputs()
             if cameras:
@@ -605,17 +669,46 @@ class FormalDashboard(QMainWindow):
                 self.capture_session.setCamera(self.camera)
                 self.capture_session.setVideoOutput(self.video_widget)
                 self.camera.start()
-                self.cam_status_lbl.setText("ZED 2i Feed: Active")
-                self.cam_status_lbl.setStyleSheet(f"color: {GREEN}; font-size: 11px; font-weight: 600; border:none; background:transparent;")
+                self._cam_state = "active"
                 print("[ZED 2i CAMERA] Local capture session connected.")
             else:
-                self.cam_status_lbl.setText("ZED 2i Feed: Awaiting Stream from Jetson")
-                self.cam_status_lbl.setStyleSheet(f"color: #b3690a; font-size: 11px; font-weight: 600; border:none; background:transparent;")
+                self._cam_state = "waiting"
                 print("[ZED 2i CAMERA] Ready for network stream.")
         except Exception as e:
             print(f"[ZED 2i CAMERA ERROR] {e}")
+            self._cam_state = "error"
+        self._refresh_cam_status()
+
+    def _refresh_cam_status(self):
+        """Combine connection state + Object Detection toggle into the status line under the feed."""
+        od_suffix = " \u00b7 Object detection ON" if self.object_detection_enabled else ""
+        if self._cam_state == "active":
+            self.cam_status_lbl.setText(f"ZED 2i Feed: Active{od_suffix}")
+            color = GREEN
+        elif self._cam_state == "waiting":
+            self.cam_status_lbl.setText(f"ZED 2i Feed: Awaiting Stream from Jetson{od_suffix}")
+            color = "#b3690a"
+        elif self._cam_state == "error":
             self.cam_status_lbl.setText("Camera Stream Error")
-            self.cam_status_lbl.setStyleSheet(f"color: {RED}; font-size: 11px; font-weight: 600; border:none; background:transparent;")
+            color = RED
+        else:
+            self.cam_status_lbl.setText("ZED 2i Stream: Connecting...")
+            color = TEXT_DIM
+        self.cam_status_lbl.setStyleSheet(f"color: {color}; font-size: 11px; font-weight: 600; border:none; background:transparent;")
+
+    def on_object_detection_toggled(self, checked):
+        self.object_detection_enabled = checked
+        self._refresh_cam_status()
+        self.send_udp_command("set_object_detection", {"enabled": checked})
+        print(f"[JETSON COMMAND] Object detection overlay -> {'ON' if checked else 'OFF'}")
+        # NOTE: this switches the requested stream on the Jetson side and updates the
+        # status line here. Actually swapping the *displayed* video between the raw
+        # ZED feed and the annotated/object-detection feed depends on how the Jetson
+        # streams video to this app (e.g. two separate RTP/UDP ports, or one port with
+        # a mode flag). That network video pipeline isn't wired up in this file yet
+        # (video_widget currently only shows a locally attached camera, if any, as a
+        # placeholder) -- once it is, point self.video_widget's source at the
+        # raw-feed vs. detection-feed stream here based on self.object_detection_enabled.
 
     # ------------------------------------------------------------------
     # Start / stop
