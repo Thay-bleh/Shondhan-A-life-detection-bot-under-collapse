@@ -11,7 +11,7 @@ from PySide6.QtMultimedia import QCamera, QMediaDevices, QMediaCaptureSession
 from PySide6.QtMultimediaWidgets import QVideoWidget
 
 # ---------------------------------------------------------------------------
-# Palette
+# Palette (matches the approved HTML mockup)
 # ---------------------------------------------------------------------------
 BG = "#f3f5f8"
 PANEL = "#ffffff"
@@ -65,8 +65,56 @@ class TelemetryReceiver(QThread):
         self.sock.close()
 
 
+class GasDial(QWidget):
+    """Circular gauge matching the HTML mockup's SVG ring: track + value arc + centred value."""
+    def __init__(self, max_val=50.0, diameter=84):
+        super().__init__()
+        self.max_val = max_val
+        self.value = 0.0
+        self.is_alert = False
+        self.setFixedSize(diameter, diameter)
+
+    def set_value(self, value, is_alert):
+        self.value = value
+        self.is_alert = is_alert
+        self.update()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+
+        stroke = 8
+        rect = QRectF(stroke / 2, stroke / 2, self.width() - stroke, self.height() - stroke)
+
+        # track
+        painter.setPen(QPen(QColor(BORDER), stroke, Qt.SolidLine, Qt.RoundCap))
+        painter.drawArc(rect, 0, 360 * 16)
+
+        # value arc, starting at 12 o'clock, sweeping clockwise
+        pct = max(0.0, min(1.0, self.value / self.max_val))
+        color = QColor(RED) if self.is_alert else QColor(TEAL)
+        painter.setPen(QPen(color, stroke, Qt.SolidLine, Qt.RoundCap))
+        span = int(-pct * 360 * 16)
+        painter.drawArc(rect, 90 * 16, span)
+
+        # centred value text
+        painter.setPen(QColor(RED) if self.is_alert else QColor(TEXT))
+        font = painter.font()
+        font.setFamily("Consolas")
+        font.setPointSize(11)
+        font.setBold(True)
+        painter.setFont(font)
+        painter.drawText(self.rect().adjusted(0, -6, 0, -6), Qt.AlignCenter, f"{self.value:.1f}")
+
+        painter.setPen(QColor(TEXT_FAINT))
+        font.setPointSize(7)
+        font.setBold(False)
+        painter.setFont(font)
+        painter.drawText(self.rect().adjusted(0, 16, 0, 16), Qt.AlignCenter, "PPM")
+
+
 class SensorCard(QFrame):
-    """Clean metric card for the MQ2 gas sensor, read via Teensy."""
+    """MQ2 gas sensor card: a radial dial plus name/description, mirroring the mockup."""
     def __init__(self, title, unit="ppm", max_val=50.0, alert_val=20.0, accent_color=TEAL):
         super().__init__()
         self.unit = unit
@@ -82,52 +130,30 @@ class SensorCard(QFrame):
             }}
         """)
 
-        layout = QVBoxLayout(self)
+        layout = QHBoxLayout(self)
         layout.setContentsMargins(16, 14, 16, 14)
-        layout.setSpacing(8)
+        layout.setSpacing(16)
 
-        hdr_layout = QHBoxLayout()
+        self.dial = GasDial(max_val=max_val)
+        layout.addWidget(self.dial, 0, Qt.AlignTop)
+
+        meta = QVBoxLayout()
+        meta.setSpacing(4)
         self.title_lbl = QLabel(title)
         self.title_lbl.setStyleSheet(f"color: {TEXT}; font-size: 13px; font-weight: 700; border:none; background:transparent;")
-        hdr_layout.addWidget(self.title_lbl)
-        hdr_layout.addStretch()
-
-        self.val_lbl = QLabel(f"0.0 {unit}")
-        self.val_lbl.setStyleSheet(f"color: {TEAL}; font-size: 16px; font-weight: 700; font-family: Consolas, monospace; border:none; background:transparent;")
-        hdr_layout.addWidget(self.val_lbl)
-        layout.addLayout(hdr_layout)
+        meta.addWidget(self.title_lbl)
 
         self.desc_lbl = QLabel(f"Analog reading from Teensy, scaled 0\u201350 {unit}. Alerts above {alert_val:.0f} {unit}.")
         self.desc_lbl.setWordWrap(True)
         self.desc_lbl.setStyleSheet(f"color: {TEXT_DIM}; font-size: 11px; border:none; background:transparent;")
-        layout.addWidget(self.desc_lbl)
+        meta.addWidget(self.desc_lbl)
+        meta.addStretch()
 
-        self.progress = QProgressBar()
-        self.progress.setFixedHeight(8)
-        self.progress.setTextVisible(False)
-        self.progress.setRange(0, 100)
-        self.progress.setValue(0)
-        self._paint_bar(is_alert=False)
-        layout.addWidget(self.progress)
-
-    def _paint_bar(self, is_alert):
-        color = RED if is_alert else self.accent_color
-        track = "#fde5e2" if is_alert else PANEL
-        self.progress.setStyleSheet(f"""
-            QProgressBar {{ background-color: {track}; border: none; border-radius: 4px; }}
-            QProgressBar::chunk {{ background-color: {color}; border-radius: 4px; }}
-        """)
+        layout.addLayout(meta, 1)
 
     def update_value(self, val):
         is_alert = val > self.alert_val
-        self.val_lbl.setText(f"{val:.1f} {self.unit}")
-        self.val_lbl.setStyleSheet(
-            f"color: {RED if is_alert else TEAL}; font-size: 16px; font-weight: 700; "
-            f"font-family: Consolas, monospace; border:none; background:transparent;"
-        )
-        perc = int(min(100, max(0, (val / self.max_val) * 100)))
-        self.progress.setValue(perc)
-        self._paint_bar(is_alert)
+        self.dial.set_value(val, is_alert)
         return is_alert
 
 
@@ -336,6 +362,9 @@ class FormalDashboard(QMainWindow):
         self.init_ui()
         self.setup_camera()
 
+        # global WASD capture regardless of which widget currently has focus
+        QApplication.instance().installEventFilter(self)
+
         self.receiver = TelemetryReceiver(self.telemetry_port)
         self.receiver.data_received.connect(self.handle_telemetry)
         self.receiver.start()
@@ -380,7 +409,12 @@ class FormalDashboard(QMainWindow):
         self.setCentralWidget(scroll)
 
         main_widget = QWidget()
+        main_widget.setObjectName("mainWidget")
+        main_widget.setStyleSheet(f"QWidget#mainWidget {{ background-color: {BG}; }}")
         scroll.setWidget(main_widget)
+        # QScrollArea's viewport is a separate widget from the scroll area frame itself;
+        # without this it falls back to the OS/Qt-style default palette (often dark).
+        scroll.viewport().setStyleSheet(f"background-color: {BG};")
 
         root_layout = QVBoxLayout(main_widget)
         root_layout.setContentsMargins(18, 16, 18, 16)
@@ -610,15 +644,19 @@ class FormalDashboard(QMainWindow):
     # ------------------------------------------------------------------
     # Manual navigation (WASD -> throttle / steering pulses)
     # ------------------------------------------------------------------
-    def keyPressEvent(self, event):
-        if event.isAutoRepeat():
-            return
-        self._handle_key(event.key(), True)
-
-    def keyReleaseEvent(self, event):
-        if event.isAutoRepeat():
-            return
-        self._handle_key(event.key(), False)
+    # An application-wide event filter is used instead of overriding
+    # keyPressEvent/keyReleaseEvent on the window: with a QScrollArea as the
+    # central widget, keyboard focus usually lands on whichever button or
+    # field was last clicked, and QMainWindow.keyPressEvent never sees the
+    # key. The filter intercepts W/A/S/D no matter which widget has focus.
+    # It's safe to swallow these globally since no field in this app accepts
+    # letter input (servo custom angles are digits-only).
+    def eventFilter(self, obj, event):
+        if event.type() in (QEvent.KeyPress, QEvent.KeyRelease) and not event.isAutoRepeat():
+            if event.key() in (Qt.Key_W, Qt.Key_A, Qt.Key_S, Qt.Key_D):
+                self._handle_key(event.key(), event.type() == QEvent.KeyPress)
+                return True
+        return super().eventFilter(obj, event)
 
     def _handle_key(self, qt_key, pressed):
         mapping = {Qt.Key_W: "w", Qt.Key_A: "a", Qt.Key_S: "s", Qt.Key_D: "d"}
@@ -702,6 +740,22 @@ class FormalDashboard(QMainWindow):
 
 def main():
     app = QApplication(sys.argv)
+
+    # Force a light palette so any widget chrome not covered by our stylesheets
+    # (scrollbars, native menus, etc.) doesn't fall back to a dark OS/Qt theme.
+    app.setStyle("Fusion")
+    palette = QPalette()
+    palette.setColor(QPalette.Window, QColor(BG))
+    palette.setColor(QPalette.WindowText, QColor(TEXT))
+    palette.setColor(QPalette.Base, QColor(PANEL))
+    palette.setColor(QPalette.AlternateBase, QColor(PANEL_2))
+    palette.setColor(QPalette.Text, QColor(TEXT))
+    palette.setColor(QPalette.Button, QColor(PANEL))
+    palette.setColor(QPalette.ButtonText, QColor(TEXT))
+    palette.setColor(QPalette.ToolTipBase, QColor(PANEL))
+    palette.setColor(QPalette.ToolTipText, QColor(TEXT))
+    app.setPalette(palette)
+
     dashboard = FormalDashboard()
     dashboard.show()
     sys.exit(app.exec())
